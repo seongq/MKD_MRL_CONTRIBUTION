@@ -1,0 +1,11 @@
+1. calibrating하면서 score만 구하지 말고 classifier 학습하자.
+
+## 설명
+모달리티 a,v,l이 있을 때 모달리티 하나 선택해서 그 모달리티와 관계 끊고 calibration
+예를드렁
+a,v,l에서 l이 채택되면 a,v,l다넣어서 계산하는거 기본으로 하고
+a,v,l을 넣은데 (a,v)와 l사이의 관계는 끊는다. 그리고 나온거를 가지고 ( (a,v), l) calibration
+
+## 개선
+loss 앞에 hyper parameter tuning term 
+calibrated multimodal learning에 나온 방법 그대로
