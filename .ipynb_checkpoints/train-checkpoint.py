@@ -1,4 +1,6 @@
 import os
+import itertools
+
 from tqdm import tqdm
 import wandb
 import os, re, datetime
@@ -10,7 +12,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data.sampler import SubsetRandomSampler
 from dataloader import IEMOCAPDataset, MELDDataset
-from model import MaskedNLLLoss,  Model,  FocalLoss
+from model import MaskedNLLLoss,  Model,  FocalLoss, Loss_Function
 from sklearn.metrics import f1_score, confusion_matrix, accuracy_score, classification_report
 import pickle as pk
 import datetime
@@ -47,7 +49,7 @@ def get_train_valid_sampler(trainset, valid=0.1, dataset='IEMOCAP'):
 
 
 def get_MELD_loaders(batch_size=32, valid=0.1, num_workers=0, pin_memory=False):
-    trainset = MELDDataset('/home/ubuntu/seongq/dataset/meld_multimodal_features.pkl')
+    trainset = MELDDataset('/workspace/datasets/meld_multimodal_features.pkl')
     train_sampler, valid_sampler = get_train_valid_sampler(trainset, valid, 'MELD')
 
     train_loader = DataLoader(trainset,
@@ -64,7 +66,7 @@ def get_MELD_loaders(batch_size=32, valid=0.1, num_workers=0, pin_memory=False):
                               num_workers=num_workers,
                               pin_memory=pin_memory)
 
-    testset = MELDDataset('/home/ubuntu/seongq/dataset/meld_multimodal_features.pkl', train=False)
+    testset = MELDDataset( train=False)
     test_loader = DataLoader(testset,
                              batch_size=batch_size,
                              collate_fn=testset.collate_fn,
@@ -112,36 +114,81 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, cuda,opti
     else:
         model.eval()
 
-    seed_everything(args)
     it = tqdm(dataloader, total=len(dataloader), desc=f"Train {epoch+1}") if train else dataloader
     for data in it:
+        textf1,textf2,textf3,textf4, visuf, acouf, qmask, umask, label = [d.to(device) for d in data[:-2]] if cuda else data[:-2]
+        lengths = [(umask[j] == 1).nonzero(as_tuple=False).tolist()[-1][0] + 1 for j in range(len(umask))]
+    
+        label = torch.cat([label[j][:lengths[j]] for j in range(len(label))])
+        # print(label)
         if train:
             optimizer.zero_grad()
-        
-        textf1,textf2,textf3,textf4, visuf, acouf, qmask, umask, label = [d.to(device) for d in data[:-2]] if cuda else data[:-2]
-        
+            logits, logits_uni_modal_student, logits_MKD_teacher, logits_MRL_feature, logits_modal =  model([textf1,textf2,textf3,textf4], qmask, umask, lengths, acouf, visuf, epoch)
+            loss = 0
 
-        lengths = [(umask[j] == 1).nonzero(as_tuple=False).tolist()[-1][0] + 1 for j in range(len(umask))]
+            loss_classification = loss_function(logits,label)
+            loss += loss_classification
+            if args.MKD:
+                loss_MKD_teacher_classification = 0
+                loss_MKD_student_classification = 0 
+                loss_MKD_distillation = 0
 
-        label = torch.cat([label[j][:lengths[j]] for j in range(len(label))])
-    
-        logits = model([textf1,textf2,textf3,textf4], qmask, umask, lengths, acouf, visuf, epoch)
-        if args.loss_cls == "Focal":
-            loss_classification = loss_function(logits, label)
-        elif args.loss_cls == "NLL":
-            loss_classification = loss_function(F.log_softmax(logits, 1), label)
-       
+                for key in logits_MKD_teacher.keys():
+                    loss_MKD_teacher_classification += loss_function(logits_MKD_teacher[key], label)
+
+                for key in logits_uni_modal_student.keys():
+                    loss_MKD_student_classification += loss_function(logits_uni_modal_student[key], label)
+
+                for key in logits_MKD_teacher.keys():
+
+                    loss_MKD_distillation += F.kl_div(F.log_softmax(logits_uni_modal_student[key] , dim=1), F.softmax(logits_MKD_teacher[key].detach() , dim=1), reduction="batchmean")
+
+                loss += loss_MKD_teacher_classification*args.MKD_teacher_classification_coeff
+                loss += loss_MKD_student_classification*args.MKD_student_classification_coeff
+                loss += loss_MKD_distillation*args.MKD_coeff
             
-        loss =  loss_classification
-        
-        
+            if args.MRL:
+                loss_MRL = 0 
+                for key in logits_MRL_feature.keys():
+                    loss_MRL += loss_function(logits_MRL_feature[key], label)
+
+                loss += loss_MRL*args.MRL_coeff
+
+            if args.calib:
+                loss_calib_classification = 0
+                loss_calib = 0
+                for key in logits_modal.keys():
+                    loss_calib_classification += loss_function(logits_modal[key], label)
+                key_pairs = list(itertools.combinations(list(logits_modal.keys()),2))
+                # print(key_pairs)
+
+                for key in logits_modal.keys():
+                    loss_calib += F.relu( F.softmax(logits_modal[key], dim=-1).max(dim=-1).values- F.softmax(logits,dim=-1).max(dim=-1).values)
+                
+                for key_a, key_b in key_pairs:
+                    if (key_a in key_b) or (key_b in key_a):
+                        if key_a in key_b:
+                            more_modalities = key_b
+                            less_modalities = key_a
+                        elif key_b in key_a:
+                            more_modalities = key_a
+                            less_modalities = key_b
+                        loss_calib += F.relu( F.softmax(logits_modal[less_modalities],dim=-1).max(dim=-1).values-F.softmax(logits_modal[more_modalities], dim=-1).max(dim=-1).values)
+                loss_calib = loss_calib.mean()
+                    
+                loss+=loss_calib_classification*args.CALIB_classification_coeff
+                loss+=loss_calib*args.CALIB_coeff
+            loss.backward()
+            optimizer.step()
+            
+        else:
+            logits, _, _, _ ,_=  model([textf1,textf2,textf3,textf4], qmask, umask, lengths, acouf, visuf, epoch)
+            loss = loss_function(logits,label)
         
         preds.append(torch.argmax(logits, 1).cpu().numpy())
         labels.append(label.cpu().numpy())
         losses.append(loss.item())
-        if train:
-            loss.backward()
-            optimizer.step()
+        
 
     if preds!=[]:
         preds  = np.concatenate(preds)
@@ -181,17 +228,24 @@ if __name__ == '__main__':
     parser.add_argument('--class-weight', action='store_true', default=False, help='use class weights')
     
     parser.add_argument("--loss_cls", choices=("Focal", "NLL"))
-    parser.add_argument('--use_residue', action='store_true', default=False, help='whether to use residue information or not')
     parser.add_argument('--stablizing', action="store_true")
 
     parser.add_argument('--Dataset', default='IEMOCAP', help='dataset to train and test')
     parser.add_argument('--testing', action='store_true', default=False, help='testing')
-    parser.add_argument("--num_heads_audio",default=4,type=int)
-    parser.add_argument("--num_heads_visual",default=4,type=int)
-    parser.add_argument("--num_heads_text",default=4,type=int)
+   
     parser.add_argument('--focal_prob', default='log_prob', choices=('prob', 'log_prob'), help='use probability or log_probability in focal loss')
-    parser.add_argument("--using_crossmodal_attention", action="store_true", default=False)
-    
+    parser.add_argument("--MKD", action="store_true", default=False)
+    parser.add_argument("--MRL", action="store_true", default=False)
+    parser.add_argument("--MRL_efficient", action="store_true", default=False)
+    parser.add_argument("--mrl_num_partition", type=int, default=3)
+    parser.add_argument("--loss_type", required=True, choices=("Focal", "NLL"))
+    parser.add_argument("--calib", action="store_true", default=False)
+    parser.add_argument("--MKD_coeff",type=float, default=0.1)
+    parser.add_argument("--MKD_teacher_classification_coeff",type=float, default=0.1)
+    parser.add_argument("--MKD_student_classification_coeff", type=float,default=0.1)
+    parser.add_argument("--MRL_coeff",type=float, default=0.1)
+    parser.add_argument("--CALIB_coeff", default=0.1,type=float)
+    parser.add_argument("--CALIB_classification_coeff", default=0.1,type=float)
     args = parser.parse_args()
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     print(args)
@@ -216,20 +270,18 @@ if __name__ == '__main__':
     D_visual = feat2dim['denseface']
     D_text = 1024 #feat2dim['textCNN'] if args.Dataset=='IEMOCAP' else feat2dim['MELD_text']
 
-    D_m = 1024
 
     D_g = 1024 
-    D_h = 100
-    D_a = 100
+
     n_speakers = 9 if args.Dataset=='MELD' else 2
     n_classes  = 7 if args.Dataset=='MELD' else 6 if args.Dataset=='IEMOCAP' else 1
 
 
 
     seed_everything(args)
-    run_name = f"{args.Dataset}_batch_{args.batch_size}_lr_{args.lr}_{timestamp}"
+    run_name = f"{timestamp}_{args.Dataset}"
     wandb.init(
-        project="MGLRA_limitation_0916",   # ← 고정
+        project="MGLRA_MKD_MRL_CALIB_GAZA_202509222259",   # ← 고정
         name=run_name,
         config=vars(args)
     )
@@ -237,43 +289,38 @@ if __name__ == '__main__':
     wb_id = run.id if run is not None else "noWB"
     wb_nm = (run.name or wb_id) if run is not None else "noWB"
     wb_ver = wandb.__version__
-    model = Model(D_m, 
-                D_g,  
+    model = Model(
+        MKD = args.MKD,
+        use_speaker_embedding=args.use_speaker_embedding,
+                
                 n_speakers=n_speakers,
                 n_classes=n_classes,
                 dropout=args.dropout,
                 no_cuda=args.no_cuda,
-                use_residue=args.use_residue,
-                D_m_v = D_visual,
                 D_m_a = D_audio,
+                D_m_v = D_visual,
+                D_m_l = D_text,
+                hidden_dim = D_g,
                 dataset=args.Dataset,
+                MRL = args.MRL,
+                MRL_efficient = args.MRL_efficient,
+                mrl_num_partition = args.mrl_num_partition,
+                calib = args.calib,
                 args = args)
 
 
     if cuda:
         model.to(device)
 
-    if args.Dataset == 'IEMOCAP':
-        loss_weights = torch.FloatTensor([1/0.086747,
+    loss_weights = torch.FloatTensor([1/0.086747,
                                         1/0.144406,
                                         1/0.227883,
                                         1/0.160585,
                                         1/0.127711,
                                         1/0.252668])
 
-    if args.Dataset == 'MELD':
-        if args.loss_cls == "Focal":
-            loss_function = FocalLoss(args=args)
-        elif args.loss_cls == "NLL":
-            loss_function = nn.NLLLoss()
-    elif args.Dataset == "IEMOCAP":
-        if args.loss_cls == "Focal":
-            loss_function  = FocalLoss(args=args)
-        elif args.loss_cls == "NLL":
-            if args.class_weight:
-                loss_function  = nn.NLLLoss(loss_weights.to(device) if cuda else loss_weights)
-            else:
-                loss_function  = nn.NLLLoss()
+    loss_function = Loss_Function(args.class_weight, loss_weights.to(device) if cuda else loss_weights, args.loss_type, args.Dataset, args.focal_prob)
+
         
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.l2)
@@ -297,21 +344,11 @@ if __name__ == '__main__':
 
     import os, re, datetime
 
-    def make_setting_tag(args):
-        tag = (
-            f"ds-{args.Dataset}"
-            f"_bs-{args.batch_size}"
-            f"_lr-{args.lr}"
-            f"_{timestamp}"
-        )
-        return re.sub(r'[^A-Za-z0-9_.-]+', '', tag)
+ 
+    
+    setting_dir = str(timestamp) + "_"+ args.Dataset 
 
-    def sanitize(s: str) -> str:  # ← NEW
-        return re.sub(r'[^A-Za-z0-9_.-]+', '', s)
-    wb_tag = sanitize(f"wb-{wb_nm}-{wb_id}-lib{wb_ver}")
-    setting_dir = sanitize(f"{make_setting_tag(args)}__{wb_tag}")
-
-    save_root = os.path.join("ckpt_0916_simplied", setting_dir)              # ← setting 요약이 폴더명에 들어감
+    save_root = os.path.join("CKPT", setting_dir)              # ← setting 요약이 폴더명에 들어감
     os.makedirs(save_root, exist_ok=True)
     
     args_with_wb = {**vars(args), "wandb_id": wb_id, "wandb_name": wb_nm, "wandb_version": wb_ver}
@@ -351,7 +388,7 @@ if __name__ == '__main__':
                         print(f"[WARN] remove fail: {fpath} ({e})")
 
             # 2) 새 모델 저장
-            ckpt_name = f"{timestamp}_epoch_{e+1}_{args.Dataset}_bestF1-{best_fscore:.2f}_bestAcc-{best_acc:.2f}_wb-{wb_id}.pt"
+            ckpt_name = f"{args.Dataset}_bestF1-{best_fscore:.2f}_bestAcc-{best_acc:.2f}.pt"
             ckpt_path = os.path.join(save_root, ckpt_name)
 
             torch.save({

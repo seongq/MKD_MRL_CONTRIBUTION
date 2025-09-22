@@ -1,6 +1,6 @@
 
 
-
+import itertools
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,13 +11,45 @@ import numpy as np, itertools, random, copy, math
 def print_grad(grad):
     print('the grad is', grad[2][0:5])
     return grad
+class Loss_Function(nn.Module):
+    def __init__(self, class_weight=False, weight=None , loss_type = "Focal", dataset="MELD", focal_prob="softmax", gamma = 2.5, alpha = 1, reduction = 'mean'):
+        super(Loss_Function, self).__init__()
+        self.loss_type = loss_type
+        self.class_weight = class_weight
+        self.weight = weight
+        self.dataset = dataset
+        if self.loss_type == "Focal":
+            self.focal_prob = focal_prob
+            self.gamma = gamma
+            self.alpha = alpha
+            self.reduction = reduction
+            self.elipson = 0.000001
+            self.loss_function = FocalLoss(self.gamma, self.alpha, self.reduction, self.focal_prob)
+
+        elif self.loss_type == "NLL":
+            if self.class_weight:
+                if self.dataset=="IEMOCAP":
+                    self.loss_function = nn.NLLLoss(weight)
+                elif self.dataset=="MELD":
+                    self.loss_function = nn.NLLLoss()
+            else:
+                self.loss_function = nn.NLLLoss()
+
+                
+    def forward(self, logits, labels):
+        
+        if self.loss_type == "Focal":
+            
+            return self.loss_function(logits, labels)
+        elif self.loss_type == "NLL":
+            return self.loss_function(F.log_softmax(logits,dim=-1), labels)
 
 class FocalLoss(nn.Module):
-    def __init__(self, gamma = 2.5, alpha = 1, size_average = True, focal_prob='prob',args = None):
+    def __init__(self, gamma = 2.5, alpha = 1, reduction = 'mean', focal_prob='prob',args = None):
         super(FocalLoss, self).__init__()
         self.gamma = gamma
         self.alpha = alpha
-        self.size_average = size_average
+        self.reduction = reduction
         self.elipson = 0.000001
         self.args = args
         self.focal_prob = focal_prob
@@ -54,10 +86,12 @@ class FocalLoss(nn.Module):
         pt = label_onehot * prob
         sub_pt = 1 - pt
         fl = -self.alpha * (sub_pt)**self.gamma * log_p
-        if self.size_average:
+        if self.reduction == "mean":
             return fl.mean()
-        else:
+        elif self.reduction == "sum":
             return fl.sum()
+        else:  # "none"
+            return fl
 
 class MaskedNLLLoss(nn.Module):
 
@@ -113,9 +147,19 @@ class Model(nn.Module):
                  D_m_l=1024,
                  hidden_dim = 1024,
                  dataset='IEMOCAP',
+                 MRL=False,
+                 MRL_efficient=False,
+                 mrl_num_partition=1,
+                 calib=False,
                   args=None):
         
         super(Model, self).__init__()
+        self.calib = calib
+        self.MRL = MRL
+        self.MRL_efficient = MRL_efficient
+        self.mrl_num_partition = mrl_num_partition
+
+        
         self.MKD = MKD
         self.n_classes = n_classes
         self.args = args
@@ -162,7 +206,27 @@ class Model(nn.Module):
 
         self.smax_fc = nn.Linear((self.hidden_dim)*self.num_modals, self.n_classes, bias=False)
         self.last_feature_dimension = self.smax_fc.in_features
+        if self.MRL:
+            temp = (self.last_feature_dimension // 3)//2
+            self.mrl_sizeset = []
+            if not self.MRL_efficient:
+                self.mrl_layers = nn.ModuleList([])
+            while temp > 0 and isinstance(temp, int):
+                self.mrl_sizeset.append(temp)
+                if not self.MRL_efficient:
+                    self.mrl_layers.append(nn.Linear(temp*3, self.n_classes, bias=False))
+                temp = temp //2
+                    
+            
+            self.mrl_sizeset = self.mrl_sizeset[:self.mrl_num_partition]
+            # print(self.mrl_sizeset)
+            # print(self.mrl_num_partition)
+
+        print(self.hidden_dim)
         if self.MKD:
+            self.student_a = nn.Linear((self.hidden_dim), self.n_classes, bias=False)
+            self.student_v = nn.Linear((self.hidden_dim), self.n_classes, bias=False)
+            self.student_l = nn.Linear((self.hidden_dim), self.n_classes, bias=False)
             self.uni_a = Unimodal_MODEL(
                 use_speaker_embedding=use_speaker_embedding,
                 n_speakers=n_speakers,
@@ -204,7 +268,13 @@ class Model(nn.Module):
     def forward(self, U, qmask, umask, seq_lengths, U_a=None, U_v=None, epoch=None):
 
         #=============roberta features
-     
+        logits_modal = {}
+        logits_uni_modal_student ={}
+        logits_MKD_teacher = {}
+        logits_MRL_feature = {}
+        if self.MKD:
+            logits_MKD_teacher = self.MKD_teacher_forward(U, qmask, umask, seq_lengths, U_a, U_v, epoch)
+            
         [r1,r2,r3,r4]=U
         seq_len, _, feature_dim = r1.size()
         if r1.size(0)==1:
@@ -259,11 +329,38 @@ class Model(nn.Module):
         emotions_a = simple_batch_graphify(emotions_a, seq_lengths, self.no_cuda)
         emotions_v = simple_batch_graphify(emotions_v, seq_lengths, self.no_cuda)
         emotions_l = simple_batch_graphify(emotions_l, seq_lengths, self.no_cuda)
- 
+
+        if self.calib:
+            logits_modal = self.modal_comb_forward(emotions_a, emotions_v, emotions_l)
         
-        logits_uni_modal = self.uni_modal_forward(emotions_a, emotions_v, emotions_l)
-        logits = logits_uni_modal['a'] + logits_uni_modal['v'] + logits_uni_modal['l']
-        return logits, logits_uni_modal
+        if self.MKD:
+            logits_uni_modal_student['a']=self.student_a(emotions_a)
+            logits_uni_modal_student['v']=self.student_v(emotions_v)
+            logits_uni_modal_student['l']=self.student_l(emotions_l)
+        
+        emotions_feature = torch.concat([emotions_a, emotions_v, emotions_l], dim=-1)
+
+        if self.MRL:
+            for i, size_ in enumerate(self.mrl_sizeset):
+                temp_features = torch.concat([emotions_feature[:,0:size_],
+                                              emotions_feature[:, self.last_feature_dimension//3*1:self.last_feature_dimension//3*1+size_], 
+                                              emotions_feature[:,self.last_feature_dimension//3*2:self.last_feature_dimension//3*2+size_]], 
+                                             dim=-1)
+                # print(temp_features.size())
+
+                
+                if not self.MRL_efficient:
+                    logits_MRL_feature[size_] = self.mrl_layers[i](temp_features)
+                else:
+                    W_temp = torch.cat([self.smax_fc.weight[:,0:size_], 
+                                        self.smax_fc.weight[:, self.last_feature_dimension//3*1:self.last_feature_dimension//3*1+size_], 
+                                        self.smax_fc.weight[:,self.last_feature_dimension//3*2:self.last_feature_dimension//3*2+size_]], dim=-1) 
+                    logits_MRL_feature[size_] = F.linear(temp_features, W_temp)
+                
+
+        
+        logits = self.smax_fc(emotions_feature)
+        return logits, logits_uni_modal_student, logits_MKD_teacher, logits_MRL_feature, logits_modal
     
     def MKD_teacher_forward(self, U, qmask, umask, seq_lengths, U_a=None, U_v=None, epoch=None):
         logits_MKD = {}
@@ -272,22 +369,24 @@ class Model(nn.Module):
         logits_MKD['l'] = self.uni_l(U=U, qmask=qmask, umask=umask, seq_lengths=seq_lengths, U_a=None, U_v=None, epoch=epoch)
         return logits_MKD
     
-    def uni_modal_forward(self, emotions_a, emotions_v,emotion_l):
-        logits_uni_modal = {}
-        emotions_a = self.dropout_(emotions_a)
-        emotions_v = self.dropout_(emotions_v)
-        emotion_l = self.dropout_(emotion_l)
-        emotions_a = nn.ReLU()(emotions_a)
-        emotions_v = nn.ReLU()(emotions_v)
-        emotion_l = nn.ReLU()(emotion_l)    
-        logits_uni_modal['a'] = F.linear(emotions_a, self.smax_fc.weight[:,0:self.hidden_dim].contiguous())
-        logits_uni_modal['v'] = F.linear(emotions_v, self.smax_fc.weight[:,self.hidden_dim:2*self.hidden_dim].contiguous())
-        logits_uni_modal['l'] = F.linear(emotion_l, self.smax_fc.weight[:,2*self.hidden_dim:].contiguous())
-        
-        # print(emotions_a.size(), emotions_v.size(), emotion_l.size())
-        # print(logits_uni_modal['a'].size(), logits_uni_modal['v'].size(), logits_uni_modal['l'].size())
-        # print(self.smax_fc.weight.size())
-        return logits_uni_modal
+    def modal_comb_forward(self, emotions_a, emotions_v,emotions_l):
+        logits_modal = {}
+ 
+        logits_modal['a'] = F.linear(emotions_a, self.smax_fc.weight[:,0:self.hidden_dim].contiguous())
+        logits_modal['v'] = F.linear(emotions_v, self.smax_fc.weight[:,self.hidden_dim:2*self.hidden_dim].contiguous())
+        logits_modal['l'] = F.linear(emotions_l, self.smax_fc.weight[:,2*self.hidden_dim:].contiguous())
+
+        emotions_av = torch.cat([emotions_a, emotions_v], dim=-1)
+        emotions_al = torch.cat([emotions_a, emotions_l], dim=-1)
+        emotions_vl = torch.cat([emotions_v, emotions_l], dim=-1)
+        w_av = self.smax_fc.weight[:,0:self.hidden_dim*2].contiguous()
+        w_al = torch.cat([self.smax_fc.weight[:,0:self.hidden_dim],self.smax_fc.weight[:,2*self.hidden_dim:]], dim=-1).contiguous()
+        w_vl = self.smax_fc.weight[:, self.hidden_dim:].contiguous()
+
+        logits_modal['av'] = F.linear(emotions_av, w_av)
+        logits_modal['al'] = F.linear(emotions_al, w_al)
+        logits_modal['vl'] = F.linear(emotions_vl, w_vl)
+        return logits_modal
 
 class Unimodal_MODEL(nn.Module):
 
@@ -361,7 +460,7 @@ class Unimodal_MODEL(nn.Module):
 
         self.num_modals = 3
 
-        self.smax_fc = nn.Linear((self.hidden_dim), self.n_classes)
+        self.smax_fc = nn.Linear((self.hidden_dim), self.n_classes,bias=False)
             
         self.last_feature_dimension = self.smax_fc.in_features
     def forward(self, U, qmask, umask, seq_lengths, U_a=None, U_v=None, epoch=None):

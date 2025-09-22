@@ -11,7 +11,7 @@ class IEMOCAPDataset(Dataset):
         self.videoIDs, self.videoSpeakers, self.videoLabels, self.roberta1,\
         self.roberta2, self.roberta3, self.roberta4, \
         self.videoAudio, self.videoVisual, self.videoSentence, self.trainVid,\
-        self.testVid = pickle.load(open('/workspace/datasets/iemocap_multimodal_features.pkl', 'rb'), encoding='latin1')
+        self.testVid = pickle.load(open('/home/ubuntu/seongq/dataset/iemocap_multimodal_features.pkl', 'rb'), encoding='latin1')
         self.keys = [x for x in (self.trainVid if train else self.testVid)]
 
         self.len = len(self.keys)
@@ -43,7 +43,7 @@ class MELDDataset(Dataset):
         self.videoIDs, self.videoSpeakers, self.videoLabels, self.roberta1, \
         self.roberta2, self.roberta3, self.roberta4, \
         self.videoAudio, self.videoVisual, self.videoSentence, self.trainVid,\
-        self.testVid, _ = pickle.load(open("/workspace/datasets/meld_multimodal_features.pkl", 'rb'))
+        self.testVid, _ = pickle.load(open("/home/ubuntu/seongq/dataset/meld_multimodal_features.pkl", 'rb'))
 
         self.keys = [x for x in (self.trainVid if train else self.testVid)]
 

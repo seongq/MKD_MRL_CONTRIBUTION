@@ -1,6 +1,6 @@
 
 
-
+import itertools
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,15 +11,48 @@ import numpy as np, itertools, random, copy, math
 def print_grad(grad):
     print('the grad is', grad[2][0:5])
     return grad
+class Loss_Function(nn.Module):
+    def __init__(self, class_weight=False, weight=None , loss_type = "Focal", dataset="MELD", focal_prob="softmax", gamma = 2.5, alpha = 1, reduction = 'mean'):
+        super(Loss_Function, self).__init__()
+        self.loss_type = loss_type
+        self.class_weight = class_weight
+        self.weight = weight
+        self.dataset = dataset
+        if self.loss_type == "Focal":
+            self.focal_prob = focal_prob
+            self.gamma = gamma
+            self.alpha = alpha
+            self.reduction = reduction
+            self.elipson = 0.000001
+            self.loss_function = FocalLoss(self.gamma, self.alpha, self.reduction, self.focal_prob)
+
+        elif self.loss_type == "NLL":
+            if self.class_weight:
+                if self.dataset=="IEMOCAP":
+                    self.loss_function = nn.NLLLoss(weight)
+                elif self.dataset=="MELD":
+                    self.loss_function = nn.NLLLoss()
+            else:
+                self.loss_function = nn.NLLLoss()
+
+                
+    def forward(self, logits, labels):
+        
+        if self.loss_type == "Focal":
+            
+            return self.loss_function(logits, labels)
+        elif self.loss_type == "NLL":
+            return self.loss_function(F.log_softmax(logits,dim=-1), labels)
 
 class FocalLoss(nn.Module):
-    def __init__(self, gamma = 2.5, alpha = 1, size_average = True, args = None):
+    def __init__(self, gamma = 2.5, alpha = 1, reduction = 'mean', focal_prob='prob',args = None):
         super(FocalLoss, self).__init__()
         self.gamma = gamma
         self.alpha = alpha
-        self.size_average = size_average
+        self.reduction = reduction
         self.elipson = 0.000001
         self.args = args
+        self.focal_prob = focal_prob
     
     def forward(self, logits, labels):
         """
@@ -43,9 +76,9 @@ class FocalLoss(nn.Module):
         label_onehot = torch.zeros([seq_length, labels_length], device=device).scatter_(1, new_label, 1)
 
         log_p = F.log_softmax(logits,-1)
-        if self.args.focal_prob == 'prob':
+        if self.focal_prob == 'prob':
             prob = torch.exp(log_p)    
-        elif self.args.focal_prob == 'log_prob':
+        elif self.focal_prob == 'log_prob':
             prob = log_p
         else:
             raise ValueError("Unknown focal_prob type")
@@ -53,10 +86,12 @@ class FocalLoss(nn.Module):
         pt = label_onehot * prob
         sub_pt = 1 - pt
         fl = -self.alpha * (sub_pt)**self.gamma * log_p
-        if self.size_average:
+        if self.reduction == "mean":
             return fl.mean()
-        else:
+        elif self.reduction == "sum":
             return fl.sum()
+        else:  # "none"
+            return fl
 
 class MaskedNLLLoss(nn.Module):
 
@@ -97,73 +132,42 @@ def simple_batch_graphify(features, lengths, no_cuda):
 
 
         
-class MultiHeadCrossModalAttention(nn.Module):
-    def __init__(self, img_dim, txt_dim, hidden_dim, num_heads):
-        super(MultiHeadCrossModalAttention, self).__init__()
-        assert hidden_dim % num_heads == 0, "hidden_dim 必须能被 num_heads 整除"
-        self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
-
-        # 多头投影层，将图像和文本分别映射到多头的 Q、K、V
-        self.img_query_proj = nn.Linear(img_dim, hidden_dim)
-        self.txt_key_proj = nn.Linear(txt_dim, hidden_dim)
-        self.txt_value_proj = nn.Linear(txt_dim, hidden_dim)
-
-        # 最后的输出线性变换
-        self.output_proj = nn.Linear(hidden_dim, img_dim)
-
-    def forward(self, img_features, txt_features):
-        """
-        :param img_features: [batch_size, num_regions, img_dim]
-        :param txt_features: [batch_size, num_words, txt_dim]
-        :return: 融合后的特征
-        """
-        B, R, _ = img_features.shape  # B: batch_size, R: num_regions
-        _, W, _ = txt_features.shape  # W: num_words
-
-        # 线性投影得到 Q、K、V，并 reshape 为多头格式
-        Q = self.img_query_proj(img_features).view(B, R, self.num_heads, self.head_dim).transpose(1, 2)  
-        K = self.txt_key_proj(txt_features).view(B, W, self.num_heads, self.head_dim).transpose(1, 2)  
-        V = self.txt_value_proj(txt_features).view(B, W, self.num_heads, self.head_dim).transpose(1, 2)  
-
-        # 计算注意力权重: Q·K^T / sqrt(d_k)
-        attention_scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)  
-        attention_weights = F.softmax(attention_scores, dim=-1)  
-
-        # 加权求和得到上下文表示
-        attended_features = torch.matmul(attention_weights, V)  
-
-        # 合并多头的结果
-        attended_features = attended_features.transpose(1, 2).contiguous().view(B, R, -1)  
-
-        # 输出线性变换（残差）
-        output = img_features + self.output_proj(attended_features)  
-        return output
-
 
 class Model(nn.Module):
 
     def __init__(self, 
-                 D_m,
-                 D_g,  
-                 n_speakers,
+                 MKD = False,
+                 use_speaker_embedding=True,
+                 n_speakers=2,
                  n_classes=7, 
                  dropout=0.5,
                  no_cuda=False, 
-                 use_residue=True,
                  D_m_v=512,
                  D_m_a=100,
+                 D_m_l=1024,
+                 hidden_dim = 1024,
                  dataset='IEMOCAP',
+                 MRL=False,
+                 MRL_efficient=False,
+                 mrl_num_partition=1,
+                 calib=False,
                   args=None):
         
         super(Model, self).__init__()
+        self.calib = calib
+        self.MRL = MRL
+        self.MRL_efficient = MRL_efficient
+        self.mrl_num_partition = mrl_num_partition
+
+        
+        self.MKD = MKD
+        self.n_classes = n_classes
         self.args = args
         self.no_cuda = no_cuda
         self.n_speakers = n_speakers
         self.dropout = dropout
-        self.use_residue = use_residue
-        self.D_g = D_g
-        self.multi_modal = True
+
+        self.hidden_dim = hidden_dim        
         self.dataset = dataset
         self.stablizing = args.stablizing
         
@@ -172,46 +176,105 @@ class Model(nn.Module):
         self.normBNb = nn.BatchNorm1d(1024, affine=True)
         self.normBNc = nn.BatchNorm1d(1024, affine=True)
         self.normBNd = nn.BatchNorm1d(1024, affine=True)
-        if self.args.use_speaker_embedding:
-            self.speaker_embeddings = nn.Embedding(n_speakers,  D_g)
+        self.use_speaker_embedding = use_speaker_embedding 
+        if self.use_speaker_embedding:
+            self.speaker_embeddings = nn.Embedding(n_speakers,  self.hidden_dim)
         # Encoders per modality
-        hidden_a = D_g
+        hidden_a = self.hidden_dim
         self.linear_a = nn.Linear(D_m_a, hidden_a)
-        self.enc_a = nn.LSTM(input_size=hidden_a, hidden_size=D_g//2, num_layers=2, bidirectional=True, dropout=dropout)
+        self.enc_a = nn.LSTM(input_size=hidden_a, hidden_size=self.hidden_dim//2, num_layers=2, bidirectional=True, dropout=dropout)
            
 
-        hidden_v = D_g
+        hidden_v = self.hidden_dim
         self.linear_v = nn.Linear(D_m_v, hidden_v)
-        self.enc_v = nn.LSTM(input_size=hidden_v, hidden_size=D_g//2, num_layers=2, bidirectional=True, dropout=dropout)
+        self.enc_v = nn.LSTM(input_size=hidden_v, hidden_size=self.hidden_dim//2, num_layers=2, bidirectional=True, dropout=dropout)
            
 
-        hidden_l = D_g
-        self.linear_l = nn.Linear(D_m, hidden_l)
-        self.enc_l = nn.LSTM(input_size=hidden_l, hidden_size=D_g//2, num_layers=2, bidirectional=True, dropout=dropout)
+        hidden_l = self.hidden_dim
+        self.linear_l = nn.Linear(D_m_l, hidden_l)
+        self.enc_l = nn.LSTM(input_size=hidden_l, hidden_size=self.hidden_dim//2, num_layers=2, bidirectional=True, dropout=dropout)
            
 
-        # Cross-modal attentions (target <- source)
-        self.align_a_a = MultiHeadCrossModalAttention(D_g, D_g, D_g, self.args.num_heads_audio) 
-        self.align_v_v = MultiHeadCrossModalAttention(D_g, D_g, D_g, self.args.num_heads_visual)
-        self.align_l_l = MultiHeadCrossModalAttention(D_g, D_g, D_g, self.args.num_heads_text)
-        
         # 결합 후 안정화용
-        self.ln_a = nn.LayerNorm(D_g)
-        self.ln_v = nn.LayerNorm(D_g)
-        self.ln_l = nn.LayerNorm(D_g)
+        self.ln_a = nn.LayerNorm(self.hidden_dim)
+        self.ln_v = nn.LayerNorm(self.hidden_dim)
+        self.ln_l = nn.LayerNorm(self.hidden_dim)
         self.dropout_ = nn.Dropout(self.dropout)
 
 
         self.num_modals = 3
-        if self.use_residue:
-            self.smax_fc = nn.Linear((2*D_g)*self.num_modals, n_classes)
-        else:
-            self.smax_fc = nn.Linear((D_g)*self.num_modals, n_classes)
-            self.last_feature_dimension = (D_g)*self.num_modals
+
+        self.smax_fc = nn.Linear((self.hidden_dim)*self.num_modals, self.n_classes, bias=False)
+        self.last_feature_dimension = self.smax_fc.in_features
+        if self.MRL:
+            temp = (self.last_feature_dimension // 3)//2
+            self.mrl_sizeset = []
+            if not self.MRL_efficient:
+                self.mrl_layers = nn.ModuleList([])
+            while temp > 0 and isinstance(temp, int):
+                self.mrl_sizeset.append(temp)
+                if not self.MRL_efficient:
+                    self.mrl_layers.append(nn.Linear(temp*3, self.n_classes, bias=False))
+                temp = temp //2
+                    
+            
+            self.mrl_sizeset = self.mrl_sizeset[:self.mrl_num_partition]
+            # print(self.mrl_sizeset)
+            # print(self.mrl_num_partition)
+
+        print(self.hidden_dim)
+        if self.MKD:
+            self.student_a = nn.Linear((self.hidden_dim), self.n_classes, bias=False)
+            self.student_v = nn.Linear((self.hidden_dim), self.n_classes, bias=False)
+            self.student_l = nn.Linear((self.hidden_dim), self.n_classes, bias=False)
+            self.uni_a = Unimodal_MODEL(
+                use_speaker_embedding=use_speaker_embedding,
+                n_speakers=n_speakers,
+                n_classes=self.n_classes,
+                dropout=dropout,
+                no_cuda=no_cuda,
+                D_m_a=D_m_a,
+                hidden_dim=hidden_dim,
+                dataset=dataset,
+                uni_modality="a",
+                args=args
+                )
+            self.uni_v = Unimodal_MODEL(
+                use_speaker_embedding=use_speaker_embedding, 
+                n_speakers=n_speakers,
+                n_classes=self.n_classes,
+                dropout=dropout,
+                no_cuda=no_cuda,
+                D_m_v=D_m_v,
+                hidden_dim=hidden_dim,
+                dataset=dataset,
+                uni_modality="v",
+                args=args
+            )
+                
+            self.uni_l = Unimodal_MODEL(
+                use_speaker_embedding=use_speaker_embedding,
+                n_speakers=n_speakers,
+                n_classes=self.n_classes,
+                dropout=dropout,
+                no_cuda=no_cuda,
+                D_m_l=D_m_l,
+                hidden_dim=hidden_dim,
+                dataset=dataset,
+                uni_modality="l",
+                args=args
+                )
 
     def forward(self, U, qmask, umask, seq_lengths, U_a=None, U_v=None, epoch=None):
 
         #=============roberta features
+        logits_modal = {}
+        logits_uni_modal_student ={}
+        logits_MKD_teacher = {}
+        logits_MRL_feature = {}
+        if self.MKD:
+            logits_MKD_teacher = self.MKD_teacher_forward(U, qmask, umask, seq_lengths, U_a, U_v, epoch)
+            
         [r1,r2,r3,r4]=U
         seq_len, _, feature_dim = r1.size()
         if r1.size(0)==1:
@@ -252,21 +315,6 @@ class Model(nn.Module):
         emotions_v, _ = self.enc_v(U_v)
         emotions_l, _ = self.enc_l(U_l)
         
-        original_emotions_a, original_emotions_v, original_emotions_l = simple_batch_graphify(emotions_a, seq_lengths, self.no_cuda), simple_batch_graphify(emotions_v, seq_lengths, self.no_cuda), simple_batch_graphify(emotions_l, seq_lengths, self.no_cuda)
-            # ----- Cross-modal fusion with gating (softmax over 3 terms per modality)
-        if self.args.using_crossmodal_attention:
-            
-            a0, v0, l0 = emotions_a, emotions_v, emotions_l
-
-           
-            emotions_a = self.align_a_a(a0, a0)
-            emotions_v = self.align_v_v(v0, v0)
-            emotions_l = self.align_l_l(l0, l0)
-
-           
-            
-        else:
-            pass
 
         # 결합 후 안정화 (모든 모드에 동일 적용 권장)
         if self.stablizing:
@@ -277,18 +325,224 @@ class Model(nn.Module):
             emotions_a = self.dropout_(emotions_a)
             emotions_v = self.dropout_(emotions_v)
             emotions_l = self.dropout_(emotions_l)
-        # ----- end fusion
-       
-        # 그냥 결합
-        
+     
         emotions_a = simple_batch_graphify(emotions_a, seq_lengths, self.no_cuda)
         emotions_v = simple_batch_graphify(emotions_v, seq_lengths, self.no_cuda)
         emotions_l = simple_batch_graphify(emotions_l, seq_lengths, self.no_cuda)
-        # print(emotions_a.size(), emotions_v.size(), emotions_l.size())
-        if self.use_residue:
-            emotions_feat = torch.cat([emotions_a, emotions_v, emotions_l,original_emotions_a,original_emotions_v, original_emotions_l], dim=-1)
-        else:
-            emotions_feat = torch.cat([emotions_a, emotions_v, emotions_l], dim=-1)
+
+        if self.calib:
+            logits_modal = self.modal_comb_forward(emotions_a, emotions_v, emotions_l)
+        
+        if self.MKD:
+            logits_uni_modal_student['a']=self.student_a(emotions_a)
+            logits_uni_modal_student['v']=self.student_v(emotions_v)
+            logits_uni_modal_student['l']=self.student_l(emotions_l)
+        
+        emotions_feature = torch.concat([emotions_a, emotions_v, emotions_l], dim=-1)
+
+        if self.MRL:
+            for i, size_ in enumerate(self.mrl_sizeset):
+                temp_features = torch.concat([emotions_feature[:,0:size_],
+                                              emotions_feature[:, self.last_feature_dimension//3*1:self.last_feature_dimension//3*1+size_], 
+                                              emotions_feature[:,self.last_feature_dimension//3*2:self.last_feature_dimension//3*2+size_]], 
+                                             dim=-1)
+                # print(temp_features.size())
+
+                
+                if not self.MRL_efficient:
+                    logits_MRL_feature[size_] = self.mrl_layers[i](temp_features)
+                else:
+                    W_temp = torch.cat([self.smax_fc.weight[:,0:size_], 
+                                        self.smax_fc.weight[:, self.last_feature_dimension//3*1:self.last_feature_dimension//3*1+size_], 
+                                        self.smax_fc.weight[:,self.last_feature_dimension//3*2:self.last_feature_dimension//3*2+size_]], dim=-1) 
+                    logits_MRL_feature[size_] = F.linear(temp_features, W_temp)
+                
+
+        
+        logits = self.smax_fc(emotions_feature)
+        return logits, logits_uni_modal_student, logits_MKD_teacher, logits_MRL_feature, logits_modal
+    
+    def MKD_teacher_forward(self, U, qmask, umask, seq_lengths, U_a=None, U_v=None, epoch=None):
+        logits_MKD = {}
+        logits_MKD['a'] = self.uni_a(U=None, qmask=qmask, umask=umask, seq_lengths=seq_lengths, U_a=U_a, U_v=None, epoch=epoch)
+        logits_MKD['v'] = self.uni_v(U=None, qmask=qmask, umask=umask, seq_lengths=seq_lengths, U_a=None, U_v=U_v, epoch=epoch)
+        logits_MKD['l'] = self.uni_l(U=U, qmask=qmask, umask=umask, seq_lengths=seq_lengths, U_a=None, U_v=None, epoch=epoch)
+        return logits_MKD
+    
+    def modal_comb_forward(self, emotions_a, emotions_v,emotions_l):
+        logits_modal = {}
+ 
+        logits_modal['a'] = F.linear(emotions_a, self.smax_fc.weight[:,0:self.hidden_dim].contiguous())
+        logits_modal['v'] = F.linear(emotions_v, self.smax_fc.weight[:,self.hidden_dim:2*self.hidden_dim].contiguous())
+        logits_modal['l'] = F.linear(emotions_l, self.smax_fc.weight[:,2*self.hidden_dim:].contiguous())
+
+        emotions_av = torch.cat([emotions_a, emotions_v], dim=-1)
+        emotions_al = torch.cat([emotions_a, emotions_l], dim=-1)
+        emotions_vl = torch.cat([emotions_v, emotions_l], dim=-1)
+        w_av = self.smax_fc.weight[:,0:self.hidden_dim*2].contiguous()
+        w_al = torch.cat([self.smax_fc.weight[:,0:self.hidden_dim],self.smax_fc.weight[:,2*self.hidden_dim:]], dim=-1).contiguous()
+        w_vl = self.smax_fc.weight[:, self.hidden_dim:].contiguous()
+
+        logits_modal['av'] = F.linear(emotions_av, w_av)
+        logits_modal['al'] = F.linear(emotions_al, w_al)
+        logits_modal['vl'] = F.linear(emotions_vl, w_vl)
+        return logits_modal
+
+class Unimodal_MODEL(nn.Module):
+
+    def __init__(self, 
+                 use_speaker_embedding=True,
+                 n_speakers=2,
+                 n_classes=7, 
+                 dropout=0.5,
+                 no_cuda=False, 
+                 D_m_v=512,
+                 D_m_a=100,
+                 D_m_l=1024,
+                 hidden_dim = 1024,
+                 dataset='IEMOCAP',
+                 uni_modality = "l",
+                 args=None):
+        
+        super(Unimodal_MODEL, self).__init__()
+        self.n_classes = n_classes
+        self.args = args
+        self.no_cuda = no_cuda
+        self.n_speakers = n_speakers
+        self.dropout = dropout
+
+        self.hidden_dim = hidden_dim        
+        self.dataset = dataset
+        self.stablizing = args.stablizing
+        
+        
+        
+        self.use_speaker_embedding = use_speaker_embedding 
+        if self.use_speaker_embedding:
+            self.speaker_embeddings = nn.Embedding(n_speakers,  self.hidden_dim)
+        
+        
+        self.uni_modality = uni_modality
+        
+        
+        if self.uni_modality == "l":
+            # BN for four textual streams
+            self.normBNa = nn.BatchNorm1d(1024, affine=True)
+            self.normBNb = nn.BatchNorm1d(1024, affine=True)
+            self.normBNc = nn.BatchNorm1d(1024, affine=True)
+            self.normBNd = nn.BatchNorm1d(1024, affine=True)
+            
+            
+            hidden_l = self.hidden_dim
+            self.linear_l = nn.Linear(D_m_l, hidden_l)
+            self.enc_l = nn.LSTM(input_size=hidden_l, hidden_size=self.hidden_dim//2, num_layers=2, bidirectional=True, dropout=dropout)
+            self.ln_l = nn.LayerNorm(self.hidden_dim)
+
+        
+        elif self.uni_modality == "a":
+            hidden_a = self.hidden_dim
+            self.linear_a = nn.Linear(D_m_a, hidden_a)
+            self.enc_a = nn.LSTM(input_size=hidden_a, hidden_size=self.hidden_dim//2, num_layers=2, bidirectional=True, dropout=dropout)
+            self.ln_a = nn.LayerNorm(self.hidden_dim)
+
+        elif self.uni_modality == "v":
+            hidden_v = self.hidden_dim
+            self.linear_v = nn.Linear(D_m_v, hidden_v)
+            self.enc_v = nn.LSTM(input_size=hidden_v, hidden_size=self.hidden_dim//2, num_layers=2, bidirectional=True, dropout=dropout)
+            self.ln_v = nn.LayerNorm(self.hidden_dim)
+
+
+        
+        # 결합 후 안정화용
+       
+        self.dropout_ = nn.Dropout(self.dropout)
+
+
+        self.num_modals = 3
+
+        self.smax_fc = nn.Linear((self.hidden_dim), self.n_classes,bias=False)
+            
+        self.last_feature_dimension = self.smax_fc.in_features
+    def forward(self, U, qmask, umask, seq_lengths, U_a=None, U_v=None, epoch=None):
+
+        #=============roberta features
+        if self.uni_modality =="l":
+            [r1,r2,r3,r4]=U
+            seq_len, _, feature_dim = r1.size()
+            if r1.size(0)==1:
+                pass
+            else:
+                r1 = self.normBNa(r1.transpose(0, 1).reshape(-1, feature_dim)).reshape(-1, seq_len, feature_dim).transpose(1, 0)
+                r2 = self.normBNb(r2.transpose(0, 1).reshape(-1, feature_dim)).reshape(-1, seq_len, feature_dim).transpose(1, 0)
+                r3 = self.normBNc(r3.transpose(0, 1).reshape(-1, feature_dim)).reshape(-1, seq_len, feature_dim).transpose(1, 0)
+                r4 = self.normBNd(r4.transpose(0, 1).reshape(-1, feature_dim)).reshape(-1, seq_len, feature_dim).transpose(1, 0)
+
+            U_l = (r1 + r2 + r3 + r4)/4
+            U_l = self.linear_l(U_l)
+        
+        
+        
+        elif self.uni_modality =="a":
+            # print(U_a.size())
+            # print(self.linear_a.weight.size())
+            U_a = self.linear_a(U_a)
+            
+        elif self.uni_modality =="v":
+            U_v = self.linear_v(U_v)
+        
+        
+        if self.args.use_speaker_embedding:
+            
+            spk_idx = torch.argmax(qmask, dim=-1)
+            spk_emb_vector = self.speaker_embeddings(spk_idx)
+            if self.uni_modality=="l":
+                U_l = U_l + spk_emb_vector
+            elif self.uni_modality=="v":
+                U_v = U_v + spk_emb_vector
+            elif self.uni_modality=="a":
+                U_a = U_a + spk_emb_vector
+        
+        
+        if self.uni_modality=="a":
+            U_a = self.dropout_(U_a)
+            U_a = nn.ReLU()(U_a)
+            emotions_a, _ = self.enc_a(U_a)
+            if self.stablizing:
+                emotions_a = self.ln_a(self.dropout_(emotions_a))
+               
+            else:
+                emotions_a = self.dropout_(emotions_a)
+            emotions_feat = emotions_a
+                
+
+        elif self.uni_modality=="v":
+            U_v = self.dropout_(U_v)
+            U_v = nn.ReLU()(U_v)
+            emotions_v, _ = self.enc_v(U_v)
+            if self.stablizing:
+                emotions_v = self.ln_v(self.dropout_(emotions_v))
+            else:
+                emotions_v = self.dropout_(emotions_v)
+            emotions_feat = emotions_v
+        
+
+        # Language
+        elif self.uni_modality=="l":
+            U_l = self.dropout_(U_l)
+            U_l = nn.ReLU()(U_l)
+            emotions_l, _ = self.enc_l(U_l)
+            if self.stablizing:
+                emotions_l = self.ln_l(self.dropout_(emotions_l))
+            else:
+                emotions_l = self.dropout_(emotions_l)
+            emotions_feat = emotions_l
+            
+        
+        
+        emotions_feat = simple_batch_graphify(emotions_feat, seq_lengths, self.no_cuda)
+        
+        
+        
         emotions_feat = self.dropout_(emotions_feat)
         emotions_feat = nn.ReLU()(emotions_feat)
         logits = self.smax_fc(emotions_feat)

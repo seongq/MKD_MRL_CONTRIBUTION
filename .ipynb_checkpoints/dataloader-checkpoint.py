@@ -39,11 +39,11 @@ class IEMOCAPDataset(Dataset):
         return [pad_sequence(dat[i]) if i<7 else pad_sequence(dat[i], True) if i<9 else dat[i].tolist() for i in dat]
 
 class MELDDataset(Dataset):
-    def __init__(self, path, train=True):
+    def __init__(self, train=True):
         self.videoIDs, self.videoSpeakers, self.videoLabels, self.roberta1, \
         self.roberta2, self.roberta3, self.roberta4, \
         self.videoAudio, self.videoVisual, self.videoSentence, self.trainVid,\
-        self.testVid, _ = pickle.load(open(path, 'rb'))
+        self.testVid, _ = pickle.load(open("/home/ubuntu/seongq/dataset/meld_multimodal_features.pkl", 'rb'))
 
         self.keys = [x for x in (self.trainVid if train else self.testVid)]
 
