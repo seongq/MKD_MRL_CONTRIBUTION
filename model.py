@@ -338,11 +338,11 @@ class Model(nn.Module):
             logits_uni_modal_student['v']=self.student_v(emotions_v)
             logits_uni_modal_student['l']=self.student_l(emotions_l)
         
-        emotions_feature = torch.concat([emotions_a, emotions_v, emotions_l], dim=-1)
+        emotions_feature = torch.cat([emotions_a, emotions_v, emotions_l], dim=-1)
 
         if self.MRL:
             for i, size_ in enumerate(self.mrl_sizeset):
-                temp_features = torch.concat([emotions_feature[:,0:size_],
+                temp_features = torch.cat([emotions_feature[:,0:size_],
                                               emotions_feature[:, self.last_feature_dimension//3*1:self.last_feature_dimension//3*1+size_], 
                                               emotions_feature[:,self.last_feature_dimension//3*2:self.last_feature_dimension//3*2+size_]], 
                                              dim=-1)

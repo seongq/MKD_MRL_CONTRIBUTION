@@ -280,6 +280,15 @@ if __name__ == '__main__':
 
     seed_everything(args)
     run_name = f"{timestamp}_{args.Dataset}"
+    
+    # wandb.init(
+    #     project="testtesttest",   # ← 고정
+    #     name=run_name,
+    #     config=vars(args)
+    # )
+
+    
+    
     wandb.init(
         project="MGLRA_MKD_MRL_CALIB_GAZA_202509222259",   # ← 고정
         name=run_name,
