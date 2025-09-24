@@ -123,7 +123,7 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, cuda,opti
         # print(label)
         if train:
             optimizer.zero_grad()
-            logits, logits_uni_modal_student, logits_MKD_teacher, logits_MRL_feature, logits_modal =  model([textf1,textf2,textf3,textf4], qmask, umask, lengths, acouf, visuf, epoch)
+            logits, logits_uni_modal_student, logits_MKD_teacher, logits_MRL_feature, logits_modal, logits_uni_modal =  model([textf1,textf2,textf3,textf4], qmask, umask, lengths, acouf, visuf, epoch)
             loss = 0
 
             loss_classification = loss_function(logits,label)
@@ -132,20 +132,27 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, cuda,opti
                 loss_MKD_teacher_classification = 0
                 loss_MKD_student_classification = 0 
                 loss_MKD_distillation = 0
+                loss_MKD_lastlayer_classification = 0 
+                loss_MKD_lastlayer_distillation = 0
 
                 for key in logits_MKD_teacher.keys():
                     loss_MKD_teacher_classification += loss_function(logits_MKD_teacher[key], label)
-
+                    
                 for key in logits_uni_modal_student.keys():
                     loss_MKD_student_classification += loss_function(logits_uni_modal_student[key], label)
-
+                    if args.MKD_last_layer:
+                        loss_MKD_lastlayer_classification +=loss_function(logits_uni_modal[key], label)
                 for key in logits_MKD_teacher.keys():
 
                     loss_MKD_distillation += F.kl_div(F.log_softmax(logits_uni_modal_student[key] , dim=1), F.softmax(logits_MKD_teacher[key].detach() , dim=1), reduction="batchmean")
+                    if args.MKD_last_layer:
+                        loss_MKD_lastlayer_distillation += F.kl_div(F.log_softmax(logits_uni_modal[key] , dim=1), F.softmax(logits_MKD_teacher[key].detach() , dim=1), reduction="batchmean")
 
                 loss += loss_MKD_teacher_classification*args.MKD_teacher_classification_coeff
                 loss += loss_MKD_student_classification*args.MKD_student_classification_coeff
                 loss += loss_MKD_distillation*args.MKD_coeff
+                loss += loss_MKD_lastlayer_classification*args.MKD_lastlayer_classification_coeff
+                loss += loss_MKD_lastlayer_distillation*args.MKD_lastlayer_distillation_coeff
             
             if args.MRL:
                 loss_MRL = 0 
@@ -182,7 +189,7 @@ def train_or_eval_graph_model(model, loss_function, dataloader, epoch, cuda,opti
             optimizer.step()
             
         else:
-            logits, _, _, _ ,_=  model([textf1,textf2,textf3,textf4], qmask, umask, lengths, acouf, visuf, epoch)
+            logits, _, _, _ ,_,_=  model([textf1,textf2,textf3,textf4], qmask, umask, lengths, acouf, visuf, epoch)
             loss = loss_function(logits,label)
         
         preds.append(torch.argmax(logits, 1).cpu().numpy())
@@ -240,12 +247,21 @@ if __name__ == '__main__':
     parser.add_argument("--mrl_num_partition", type=int, default=3)
     parser.add_argument("--loss_type", required=True, choices=("Focal", "NLL"))
     parser.add_argument("--calib", action="store_true", default=False)
-    parser.add_argument("--MKD_coeff",type=float, default=0.1)
-    parser.add_argument("--MKD_teacher_classification_coeff",type=float, default=0.1)
-    parser.add_argument("--MKD_student_classification_coeff", type=float,default=0.1)
-    parser.add_argument("--MRL_coeff",type=float, default=0.1)
-    parser.add_argument("--CALIB_coeff", default=0.1,type=float)
-    parser.add_argument("--CALIB_classification_coeff", default=0.1,type=float)
+    
+    parser.add_argument("--MKD_coeff",type=float, default=1)
+    parser.add_argument("--MKD_teacher_classification_coeff",type=float, default=1)
+    parser.add_argument("--MKD_student_classification_coeff", type=float,default=1)
+    parser.add_argument("--MKD_last_layer", default=False, action="store_true")
+    parser.add_argument("--MKD_lastlayer_classification_coeff", default= 1, type=float)
+    parser.add_argument("--MKD_lastlayer_distillation_coeff", default=1, type=float)
+    
+    parser.add_argument("--MRL_coeff",type=float, default=1)
+    parser.add_argument("--CALIB_coeff", default=1,type=float)
+    parser.add_argument("--CALIB_classification_coeff", default=1,type=float)
+
+    
+    parser.add_argument("--using_MHA", default=False, action="store_true")
+    parser.add_argument("--number_of_heads", default=2, type=int, choices=(1,2,4,8,16))
     args = parser.parse_args()
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     print(args)
@@ -280,8 +296,17 @@ if __name__ == '__main__':
 
     seed_everything(args)
     run_name = f"{timestamp}_{args.Dataset}"
+    
+    # wandb.init(
+    #     project="testtesttest",   # ← 고정
+    #     name=run_name,
+    #     config=vars(args)
+    # )
+
+    
+    
     wandb.init(
-        project="MGLRA_MKD_MRL_CALIB_GAZA_202509222259",   # ← 고정
+        project="TESTTEST",   # ← 고정
         name=run_name,
         config=vars(args)
     )
@@ -306,6 +331,9 @@ if __name__ == '__main__':
                 MRL_efficient = args.MRL_efficient,
                 mrl_num_partition = args.mrl_num_partition,
                 calib = args.calib,
+                MKD_last_layer = args.MKD_last_layer,
+                using_MHA = args.using_MHA,
+                number_of_heads = args.number_of_heads,
                 args = args)
 
 

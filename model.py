@@ -130,7 +130,48 @@ def simple_batch_graphify(features, lengths, no_cuda):
     return node_features
 
 
+class MultiHeadCrossModalAttention(nn.Module):
+    def __init__(self, img_dim, txt_dim, hidden_dim, num_heads):
+        super(MultiHeadCrossModalAttention, self).__init__()
+        assert hidden_dim % num_heads == 0, "hidden_dim 必须能被 num_heads 整除"
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
 
+        # 多头投影层，将图像和文本分别映射到多头的 Q、K、V
+        self.img_query_proj = nn.Linear(img_dim, hidden_dim)
+        self.txt_key_proj = nn.Linear(txt_dim, hidden_dim)
+        self.txt_value_proj = nn.Linear(txt_dim, hidden_dim)
+
+        # 最后的输出线性变换
+        self.output_proj = nn.Linear(hidden_dim, img_dim)
+
+    def forward(self, img_features, txt_features):
+        """
+        :param img_features: [batch_size, num_regions, img_dim]
+        :param txt_features: [batch_size, num_words, txt_dim]
+        :return: 融合后的特征
+        """
+        B, R, _ = img_features.shape  # B: batch_size, R: num_regions
+        _, W, _ = txt_features.shape  # W: num_words
+
+        # 线性投影得到 Q、K、V，并 reshape 为多头格式
+        Q = self.img_query_proj(img_features).view(B, R, self.num_heads, self.head_dim).transpose(1, 2)  
+        K = self.txt_key_proj(txt_features).view(B, W, self.num_heads, self.head_dim).transpose(1, 2)  
+        V = self.txt_value_proj(txt_features).view(B, W, self.num_heads, self.head_dim).transpose(1, 2)  
+
+        # 计算注意力权重: Q·K^T / sqrt(d_k)
+        attention_scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)  
+        attention_weights = F.softmax(attention_scores, dim=-1)  
+
+        # 加权求和得到上下文表示
+        attended_features = torch.matmul(attention_weights, V)  
+
+        # 合并多头的结果
+        attended_features = attended_features.transpose(1, 2).contiguous().view(B, R, -1)  
+
+        # 输出线性变换
+        output = img_features + self.output_proj(attended_features)  
+        return output
         
 
 class Model(nn.Module):
@@ -151,9 +192,18 @@ class Model(nn.Module):
                  MRL_efficient=False,
                  mrl_num_partition=1,
                  calib=False,
+                 MKD_last_layer =False,
+                using_MHA = False,
+                number_of_heads = 2,
                   args=None):
         
         super(Model, self).__init__()
+
+        
+        self.using_MHA = using_MHA
+        self.number_of_heads = number_of_heads
+
+        self.MKD_last_layer = MKD_last_layer
         self.calib = calib
         self.MRL = MRL
         self.MRL_efficient = MRL_efficient
@@ -194,7 +244,14 @@ class Model(nn.Module):
         self.linear_l = nn.Linear(D_m_l, hidden_l)
         self.enc_l = nn.LSTM(input_size=hidden_l, hidden_size=self.hidden_dim//2, num_layers=2, bidirectional=True, dropout=dropout)
            
+        if self.using_MHA:
+            self.attention_a = MultiHeadCrossModalAttention(self.hidden_dim,self.hidden_dim,self.hidden_dim, num_heads = self.number_of_heads)
+            self.attention_v = MultiHeadCrossModalAttention(self.hidden_dim,self.hidden_dim,self.hidden_dim, num_heads = self.number_of_heads)
+            self.attention_l = MultiHeadCrossModalAttention(self.hidden_dim,self.hidden_dim,self.hidden_dim, num_heads = self.number_of_heads)
+            
+            
 
+        
         # 결합 후 안정화용
         self.ln_a = nn.LayerNorm(self.hidden_dim)
         self.ln_v = nn.LayerNorm(self.hidden_dim)
@@ -237,6 +294,8 @@ class Model(nn.Module):
                 hidden_dim=hidden_dim,
                 dataset=dataset,
                 uni_modality="a",
+                using_MHA = self.using_MHA ,
+                number_of_heads = self.number_of_heads,
                 args=args
                 )
             self.uni_v = Unimodal_MODEL(
@@ -249,6 +308,8 @@ class Model(nn.Module):
                 hidden_dim=hidden_dim,
                 dataset=dataset,
                 uni_modality="v",
+                using_MHA = self.using_MHA ,
+                number_of_heads = self.number_of_heads,
                 args=args
             )
                 
@@ -262,6 +323,8 @@ class Model(nn.Module):
                 hidden_dim=hidden_dim,
                 dataset=dataset,
                 uni_modality="l",
+                using_MHA = self.using_MHA ,
+                number_of_heads = self.number_of_heads,
                 args=args
                 )
 
@@ -272,6 +335,7 @@ class Model(nn.Module):
         logits_uni_modal_student ={}
         logits_MKD_teacher = {}
         logits_MRL_feature = {}
+        logits_uni_modal = {}
         if self.MKD:
             logits_MKD_teacher = self.MKD_teacher_forward(U, qmask, umask, seq_lengths, U_a, U_v, epoch)
             
@@ -314,9 +378,14 @@ class Model(nn.Module):
         emotions_a, _ = self.enc_a(U_a)
         emotions_v, _ = self.enc_v(U_v)
         emotions_l, _ = self.enc_l(U_l)
-        
-
+        # print(emotions_a.size())
+        if self.using_MHA:
+            emotions_a = self.attention_a(emotions_a, emotions_a)
+            emotions_v = self.attention_v(emotions_v, emotions_v)
+            emotions_l = self.attention_l(emotions_l, emotions_l)
         # 결합 후 안정화 (모든 모드에 동일 적용 권장)
+
+        # print(emotions_a.size())
         if self.stablizing:
             emotions_a = self.ln_a(self.dropout_(emotions_a))
             emotions_v = self.ln_v(self.dropout_(emotions_v))
@@ -337,7 +406,14 @@ class Model(nn.Module):
             logits_uni_modal_student['a']=self.student_a(emotions_a)
             logits_uni_modal_student['v']=self.student_v(emotions_v)
             logits_uni_modal_student['l']=self.student_l(emotions_l)
-        
+            if self.MKD_last_layer:
+                if self.calib:
+                    logits_uni_modal['a'] = logits_modal['a']
+                    logits_uni_modal['v'] = logits_modal['v']
+                    logits_uni_modal['l'] = logits_modal['l']
+                else:
+                    logits_uni_modal = self.modal_uni_forward(emotions_a, emotions_v, emotions_l)
+                    
         emotions_feature = torch.cat([emotions_a, emotions_v, emotions_l], dim=-1)
 
         if self.MRL:
@@ -360,7 +436,7 @@ class Model(nn.Module):
 
         
         logits = self.smax_fc(emotions_feature)
-        return logits, logits_uni_modal_student, logits_MKD_teacher, logits_MRL_feature, logits_modal
+        return logits, logits_uni_modal_student, logits_MKD_teacher, logits_MRL_feature, logits_modal, logits_uni_modal
     
     def MKD_teacher_forward(self, U, qmask, umask, seq_lengths, U_a=None, U_v=None, epoch=None):
         logits_MKD = {}
@@ -387,6 +463,16 @@ class Model(nn.Module):
         logits_modal['al'] = F.linear(emotions_al, w_al)
         logits_modal['vl'] = F.linear(emotions_vl, w_vl)
         return logits_modal
+    def modal_uni_forward(self, emotions_a, emotions_v,emotions_l):
+        logits_modal = {}
+ 
+        logits_modal['a'] = F.linear(emotions_a, self.smax_fc.weight[:,0:self.hidden_dim].contiguous())
+        logits_modal['v'] = F.linear(emotions_v, self.smax_fc.weight[:,self.hidden_dim:2*self.hidden_dim].contiguous())
+        logits_modal['l'] = F.linear(emotions_l, self.smax_fc.weight[:,2*self.hidden_dim:].contiguous())
+
+        
+        return logits_modal
+        
 
 class Unimodal_MODEL(nn.Module):
 
@@ -402,6 +488,8 @@ class Unimodal_MODEL(nn.Module):
                  hidden_dim = 1024,
                  dataset='IEMOCAP',
                  uni_modality = "l",
+                 using_MHA = False,
+                number_of_heads = 2,
                  args=None):
         
         super(Unimodal_MODEL, self).__init__()
@@ -415,7 +503,8 @@ class Unimodal_MODEL(nn.Module):
         self.dataset = dataset
         self.stablizing = args.stablizing
         
-        
+        self.number_of_heads = number_of_heads
+        self.using_MHA = using_MHA
         
         self.use_speaker_embedding = use_speaker_embedding 
         if self.use_speaker_embedding:
@@ -436,6 +525,9 @@ class Unimodal_MODEL(nn.Module):
             hidden_l = self.hidden_dim
             self.linear_l = nn.Linear(D_m_l, hidden_l)
             self.enc_l = nn.LSTM(input_size=hidden_l, hidden_size=self.hidden_dim//2, num_layers=2, bidirectional=True, dropout=dropout)
+
+            if self.using_MHA:
+                self.attention_l = MultiHeadCrossModalAttention(hidden_l,hidden_l,hidden_l, num_heads = self.number_of_heads)
             self.ln_l = nn.LayerNorm(self.hidden_dim)
 
         
@@ -443,12 +535,18 @@ class Unimodal_MODEL(nn.Module):
             hidden_a = self.hidden_dim
             self.linear_a = nn.Linear(D_m_a, hidden_a)
             self.enc_a = nn.LSTM(input_size=hidden_a, hidden_size=self.hidden_dim//2, num_layers=2, bidirectional=True, dropout=dropout)
+            if self.using_MHA:
+                self.attention_a = MultiHeadCrossModalAttention(hidden_a,hidden_a,hidden_a, num_heads = self.number_of_heads)
+            
             self.ln_a = nn.LayerNorm(self.hidden_dim)
 
         elif self.uni_modality == "v":
             hidden_v = self.hidden_dim
             self.linear_v = nn.Linear(D_m_v, hidden_v)
             self.enc_v = nn.LSTM(input_size=hidden_v, hidden_size=self.hidden_dim//2, num_layers=2, bidirectional=True, dropout=dropout)
+
+            if self.using_MHA:
+                self.attention_v = MultiHeadCrossModalAttention(hidden_v,hidden_v,hidden_v, num_heads = self.number_of_heads)
             self.ln_v = nn.LayerNorm(self.hidden_dim)
 
 
@@ -507,6 +605,11 @@ class Unimodal_MODEL(nn.Module):
             U_a = self.dropout_(U_a)
             U_a = nn.ReLU()(U_a)
             emotions_a, _ = self.enc_a(U_a)
+            if self.using_MHA:
+                emotions_a = self.attention_a(emotions_a,emotions_a)
+                # print("오디오 MHA 계산함")
+
+            
             if self.stablizing:
                 emotions_a = self.ln_a(self.dropout_(emotions_a))
                
@@ -519,6 +622,9 @@ class Unimodal_MODEL(nn.Module):
             U_v = self.dropout_(U_v)
             U_v = nn.ReLU()(U_v)
             emotions_v, _ = self.enc_v(U_v)
+            if self.using_MHA:
+                emotions_v = self.attention_v(emotions_v,emotions_v)
+                # print("visual MHA 계산함")
             if self.stablizing:
                 emotions_v = self.ln_v(self.dropout_(emotions_v))
             else:
@@ -531,6 +637,9 @@ class Unimodal_MODEL(nn.Module):
             U_l = self.dropout_(U_l)
             U_l = nn.ReLU()(U_l)
             emotions_l, _ = self.enc_l(U_l)
+            if self.using_MHA:
+                emotions_l = self.attention_l(emotions_l,emotions_l)
+                # print("text MHA 계산함")
             if self.stablizing:
                 emotions_l = self.ln_l(self.dropout_(emotions_l))
             else:

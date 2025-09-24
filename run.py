@@ -46,24 +46,26 @@ while True:
         # MKD 옵션 (켜지면 관련 계수도 랜덤)
         if random.choice([True, False]):
             cmd.append("--MKD")
-            cmd += ["--MKD_coeff",                      f"{random.uniform(0.05,0.3):.3f}"]
-            cmd += ["--MKD_teacher_classification_coeff", f"{random.uniform(0.05,0.3):.3f}"]
-            cmd += ["--MKD_student_classification_coeff", f"{random.uniform(0.05,0.3):.3f}"]
-
+            if random.choice([True,False]):
+                cmd.append("--MKD_last_layer")
+         
+        if random.choice([True, False]):
+            cmd.append("--using_MHA")
+            cmd += ["--number_of_heads", str(random.choice([1,2,4,8,16]))]
         # MRL 옵션 (켜지면 efficient/partition/계수 랜덤)
         if random.choice([True, False]):
             cmd.append("--MRL")
             if random.choice([True, False]):
                 cmd.append("--MRL_efficient")
-            cmd += ["--mrl_num_partition", str(random.randint(1,3))]
-            cmd += ["--MRL_coeff", f"{random.uniform(0.05,0.3):.3f}"]
+            cmd += ["--mrl_num_partition", str(random.randint(1,11))]
 
         # CALIB 옵션 (켜지면 계수 랜덤)
         if random.choice([True, False]):
             cmd.append("--calib")
-            cmd += ["--CALIB_coeff",                f"{random.uniform(0.02,0.2):.3f}"]
-            cmd += ["--CALIB_classification_coeff", f"{random.uniform(0.05,0.3):.3f}"]
 
+
+            
+        
         # GPU 선택
         env = os.environ.copy()
         gpu_choice = random.choice(["0", "1"])
