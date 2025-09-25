@@ -262,6 +262,11 @@ if __name__ == '__main__':
     
     parser.add_argument("--using_MHA", default=False, action="store_true")
     parser.add_argument("--number_of_heads", default=2, type=int, choices=(1,2,4,8,16))
+    
+    parser.add_argument("--using_graph", default=False, action="store_true")
+    parser.add_argument("--using_multimodal_graph", default=False, action="store_true")
+    parser.add_argument("--num_K", default=4, type=int)
+    parser.add_argument("--graph_hidden_dim", default=512, type=int)
     args = parser.parse_args()
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     print(args)
@@ -306,7 +311,7 @@ if __name__ == '__main__':
     
     
     wandb.init(
-        project="TESTTEST",   # ← 고정
+        project="TESTTESTTEST20250925",   # ← 고정
         name=run_name,
         config=vars(args)
     )
@@ -334,6 +339,10 @@ if __name__ == '__main__':
                 MKD_last_layer = args.MKD_last_layer,
                 using_MHA = args.using_MHA,
                 number_of_heads = args.number_of_heads,
+                using_graph= args.using_graph,
+                using_multimodal_graph = args.using_multimodal_graph,
+                num_K = args.num_K,
+                graph_hidden_dim = args.graph_hidden_dim,
                 args = args)
 
 

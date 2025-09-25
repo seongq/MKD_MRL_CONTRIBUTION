@@ -9,11 +9,11 @@ EPOCHS       = [50,70,90,80,110,60,100,150,200,300,500,1000]
 BATCH_SIZES  = [1,2,4,8,16,32,64]
 LRS          = [1e-5, 1e-4, 1e-3]
 DROPOUTS     = [0.1,0.2,0.3,0.5]
-DATASETS     = ["IEMOCAP","MELD"]
+DATASETS     = ["MELD"]
 LOSSES       = ["Focal", "NLL"]
 FOCAL_PROB   = ["prob", "log_prob"]
 SLEEP_SECS   = 10
-
+NUM_K_CHOICES = [1,2,3,4,5,6,7,8,9,10]
 i = 0
 while True:
     try:
@@ -63,7 +63,11 @@ while True:
         if random.choice([True, False]):
             cmd.append("--calib")
 
-
+        if random.choice([True, False]):
+            cmd.append("--using_graph")
+        
+            cmd += ["--num_K", str(random.choice(NUM_K_CHOICES))]
+            # hidden_dim(=1024)과 맞추려면 2*graph_hidden_dim == hidden_dim => 512 고정
             
         
         # GPU 선택

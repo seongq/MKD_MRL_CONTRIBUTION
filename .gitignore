@@ -2,3 +2,5 @@ ckpt/
 wandb/
 ckpt*
 CKPT/
+CKPT*
+CKPT*/
