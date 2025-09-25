@@ -311,7 +311,7 @@ if __name__ == '__main__':
     
     
     wandb.init(
-        project="TESTTESTTEST20250925",   # ← 고정
+        project="CKPT_20250925_MKD_MRL_CALIB",   # ← 고정
         name=run_name,
         config=vars(args)
     )
@@ -385,7 +385,7 @@ if __name__ == '__main__':
     
     setting_dir = str(timestamp) + "_"+ args.Dataset 
 
-    save_root = os.path.join("CKPT", setting_dir)              # ← setting 요약이 폴더명에 들어감
+    save_root = os.path.join("CKPT_20250925_MKD_MRL_CALIB", setting_dir)              # ← setting 요약이 폴더명에 들어감
     os.makedirs(save_root, exist_ok=True)
     
     args_with_wb = {**vars(args), "wandb_id": wb_id, "wandb_name": wb_nm, "wandb_version": wb_ver}
