@@ -7,10 +7,174 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from torch.nn.utils.rnn import pad_sequence
 import numpy as np, itertools, random, copy, math
+from torch_geometric.nn import MessagePassing
+from torch_geometric.utils import degree
+from itertools import permutations
 
 def print_grad(grad):
     print('the grad is', grad[2][0:5])
     return grad
+class GraphGCN(MessagePassing):
+    def __init__(self, in_channels):
+        super().__init__(aggr='add')
+        self.gate = nn.Linear(2 * in_channels, 1)
+
+    def forward(self, x, edge_index):
+        # edge_index는 이미 self-loop 포함(FC 그래프)
+        return self.propagate(edge_index, size=(x.size(0), x.size(0)), x=x)
+
+    def message(self, x_i, x_j, edge_index, size):
+        row, col = edge_index  # row=src, col=dst
+        N_dst = size[1] if isinstance(size, (tuple, list)) else size
+        deg = degree(col, N_dst, dtype=x_j.dtype).clamp(min=1)
+        deg_inv_sqrt = deg.pow(-0.5)
+        norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]  # D^{-1/2} A D^{-1/2}
+
+        h2 = torch.cat([x_i, x_j], dim=1)      # [E, 2C]
+        alpha_g = torch.tanh(self.gate(h2))    # [E, 1]
+        return norm.view(-1, 1) * x_j * alpha_g
+
+    def update(self, aggr_out):
+        return aggr_out
+
+
+class UNI_GCN(nn.Module):
+    def __init__(self, n_dim, nhidden=512, num_K=4, dropout=0.2):
+        super().__init__()
+        self.fc1 = nn.Linear(n_dim, nhidden)
+        self.num_K = num_K
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        for kk in range(num_K):
+            setattr(self, f'conv{kk+1}', GraphGCN(nhidden))
+
+    def forward(self, emotions_feat, dia_len, qmask, epoch):
+
+        edge_index, feats = self.create_gnn_index(emotions_feat, dia_len)  # feats == emotions_feat
+        x = self.fc1(feats)                # [N, nhidden]
+        out = x
+
+        gnn_out = x
+        for kk in range(self.num_K):
+            conv = getattr(self, f'conv{kk+1}')
+            msg = conv(gnn_out, edge_index)       # [N, nhidden]
+            msg = F.relu(msg, inplace=False)
+            msg = self.dropout(msg)
+            gnn_out = gnn_out + msg               # residual
+
+        out2 = torch.cat([out, gnn_out], dim=1)   # [N, 2*nhidden]
+        return out2
+
+    def create_gnn_index(self, emotions_feat, dia_len):
+        assert sum(dia_len) == emotions_feat.size(0), "dia_len 합 != 노드 수"
+        device = emotions_feat.device
+        pieces = []
+        off = 0
+        for L in dia_len:
+            if L <= 0:
+                continue
+            idx = torch.arange(off, off + L, device=device)
+            src = idx.repeat_interleave(L)   # [L*L]
+            dst = idx.repeat(L)              # [L*L]
+        
+            # self-loop 제거
+            mask = src != dst
+            e = torch.stack([src[mask], dst[mask]], dim=0)
+            pieces.append(e)
+        
+            off += L
+
+        edge_index = torch.cat(pieces, dim=1) if pieces else torch.empty(2, 0, dtype=torch.long, device=device)
+        return edge_index, emotions_feat
+
+
+
+class Multimodal_GCN(nn.Module):
+    def __init__(self, n_dim, nhidden=512, dropout=0.2, num_K=4):
+        super(Multimodal_GCN, self).__init__()
+
+
+        self.act_fn = nn.ReLU()
+        self.dropout = dropout
+        #------------------------------------    
+        self.fc1 = nn.Linear(n_dim, nhidden)         
+        self.num_K =  num_K
+        for kk in range(num_K):
+            setattr(self,'conv%d' %(kk+1), GraphGCN(nhidden))
+
+    def forward(self, a, v, l, dia_len, qmask, epoch):
+        gnn_edge_index, gnn_features = self.create_gnn_index(a, v, l, dia_len)
+        x1 = self.fc1(gnn_features)  
+        out = x1
+        gnn_out = x1
+        for kk in range(self.num_K):
+            gnn_out = gnn_out + getattr(self,'conv%d' %(kk+1))(gnn_out,gnn_edge_index)
+
+        out2 = torch.cat([out,gnn_out], dim=1)
+        out1 = self.reverse_features(dia_len, out2)
+        #---------------------------------------
+        return out1
+
+    def reverse_features(self, dia_len, features):
+        
+        a=[]
+        v=[]
+        l=[]
+        for i in dia_len:
+            aa = features[0:1*i]
+            vv = features[1*i:2*i]
+            ll = features[2*i:3*i]
+            features = features[3*i:]
+            
+            a.append(aa)
+            v.append(vv)
+            l.append(ll)
+        
+        tmpa = torch.cat(a,dim=0)
+        tmpv = torch.cat(v,dim=0)
+        tmpl = torch.cat(l,dim=0)
+        features = torch.cat([tmpa, tmpv,tmpl], dim=-1)
+        return features
+
+
+    def create_gnn_index(self, a, v, l, dia_len):
+        num_modality = 3
+        node_count = 0
+        index =[]
+        tmp = []
+        
+        for i in dia_len:
+            nodes = list(range(i*num_modality))
+            nodes = [j + node_count for j in nodes] 
+            nodes_a = nodes[0:i*num_modality//3]
+            nodes_v = nodes[i*num_modality//3:i*num_modality*2//3]
+            nodes_l = nodes[i*num_modality*2//3:]
+            index = index + list(permutations(nodes_a,2)) + list(permutations(nodes_v,2)) + list(permutations(nodes_l,2))
+            Gnodes=[]
+            for _ in range(i):
+                Gnodes.append([nodes_a[_]] + [nodes_v[_]] + [nodes_l[_]])
+            for ii, _ in enumerate(Gnodes):
+                tmp = tmp +  list(permutations(_,2))
+            if node_count == 0:
+                aa = a[0:0+i]
+                vv = v[0:0+i]
+                ll = l[0:0+i]
+                features = torch.cat([aa,vv,ll],dim=0)
+                temp = 0+i
+            else:
+                
+                aa = a[temp:temp+i]
+                vv = v[temp:temp+i]
+                ll = l[temp:temp+i]
+                
+                features_temp = torch.cat([aa,vv,ll],dim=0)
+                features =  torch.cat([features,features_temp],dim=0)
+                temp = temp+i
+            node_count = node_count + i*num_modality
+        edge_index = torch.cat([torch.LongTensor(index).T,torch.LongTensor(tmp).T],1).to("cuda:0")
+        return edge_index, features
+
+
 class Loss_Function(nn.Module):
     def __init__(self, class_weight=False, weight=None , loss_type = "Focal", dataset="MELD", focal_prob="softmax", gamma = 2.5, alpha = 1, reduction = 'mean'):
         super(Loss_Function, self).__init__()
@@ -195,10 +359,18 @@ class Model(nn.Module):
                  MKD_last_layer =False,
                 using_MHA = False,
                 number_of_heads = 2,
+                using_graph = False,
+                using_multimodal_graph = False,
+                num_K = 4,
+                graph_hidden_dim = 512,
                   args=None):
         
         super(Model, self).__init__()
 
+        self.graph_hideen_dim = graph_hidden_dim
+        self.using_graph = using_graph
+        self.using_multimodal_graph = using_multimodal_graph
+        self.num_K = num_K
         
         self.using_MHA = using_MHA
         self.number_of_heads = number_of_heads
@@ -260,7 +432,18 @@ class Model(nn.Module):
 
 
         self.num_modals = 3
-
+        
+        
+        
+        if self.using_graph:
+            if not self.using_multimodal_graph:
+                self.gcn_a = UNI_GCN(self.hidden_dim, self.graph_hideen_dim, dropout=self.dropout, num_K =  self.num_K )
+                self.gcn_v = UNI_GCN(self.hidden_dim, self.graph_hideen_dim, dropout=self.dropout, num_K =  self.num_K )
+                self.gcn_l = UNI_GCN(self.hidden_dim, self.graph_hideen_dim, dropout=self.dropout, num_K =  self.num_K )  
+            elif self.using_multimodal_graph:
+                self.gcn = Multimodal_GCN(self.hidden_dim, self.graph_hideen_dim, dropout=self.dropout, num_K =  self.num_K )
+        
+        
         self.smax_fc = nn.Linear((self.hidden_dim)*self.num_modals, self.n_classes, bias=False)
         self.last_feature_dimension = self.smax_fc.in_features
         if self.MRL:
@@ -296,6 +479,10 @@ class Model(nn.Module):
                 uni_modality="a",
                 using_MHA = self.using_MHA ,
                 number_of_heads = self.number_of_heads,
+                using_graph = self.using_graph,
+                    
+                    num_K = self.num_K,
+                    graph_hidden_dim = self.graph_hideen_dim,
                 args=args
                 )
             self.uni_v = Unimodal_MODEL(
@@ -310,6 +497,10 @@ class Model(nn.Module):
                 uni_modality="v",
                 using_MHA = self.using_MHA ,
                 number_of_heads = self.number_of_heads,
+                    using_graph = self.using_graph,
+                    
+                    num_K = self.num_K,
+                    graph_hidden_dim = self.graph_hideen_dim,
                 args=args
             )
                 
@@ -325,6 +516,10 @@ class Model(nn.Module):
                 uni_modality="l",
                 using_MHA = self.using_MHA ,
                 number_of_heads = self.number_of_heads,
+                using_graph = self.using_graph,
+                    
+                    num_K = self.num_K,
+                    graph_hidden_dim = self.graph_hideen_dim,
                 args=args
                 )
 
@@ -399,6 +594,25 @@ class Model(nn.Module):
         emotions_v = simple_batch_graphify(emotions_v, seq_lengths, self.no_cuda)
         emotions_l = simple_batch_graphify(emotions_l, seq_lengths, self.no_cuda)
 
+        old_emotions_a = emotions_a
+        old_emotions_v = emotions_v
+        old_emotions_l = emotions_l
+        
+        if self.using_graph:
+            if not self.using_multimodal_graph:
+                emotions_a = self.gcn_a(emotions_a, seq_lengths, qmask, epoch)
+                emotions_v = self.gcn_v(emotions_v, seq_lengths, qmask, epoch)
+                emotions_l =  self.gcn_l(emotions_l, seq_lengths, qmask, epoch)  
+            elif self.using_multimodal_graph:
+                emotions_feature = self.gcn(emotions_a, emotions_v, emotions_l, seq_lengths, qmask, epoch)
+                FULL_DIM = emotions_feature.size(1)
+                emotions_a = emotions_feature[:,0: FULL_DIM//3]
+                emotions_v = emotions_feature[:,FULL_DIM//3:FULL_DIM//3*2]
+                emotions_l = emotions_feature[:,FULL_DIM//3*2:]
+
+        
+        
+        
         if self.calib:
             logits_modal = self.modal_comb_forward(emotions_a, emotions_v, emotions_l)
         
@@ -415,7 +629,8 @@ class Model(nn.Module):
                     logits_uni_modal = self.modal_uni_forward(emotions_a, emotions_v, emotions_l)
                     
         emotions_feature = torch.cat([emotions_a, emotions_v, emotions_l], dim=-1)
-
+        emotions_feature = nn.ReLU()(emotions_feature)
+        emotions_feature = self.dropout_(emotions_feature)
         if self.MRL:
             for i, size_ in enumerate(self.mrl_sizeset):
                 temp_features = torch.cat([emotions_feature[:,0:size_],
@@ -490,9 +705,18 @@ class Unimodal_MODEL(nn.Module):
                  uni_modality = "l",
                  using_MHA = False,
                 number_of_heads = 2,
+                using_graph = False,
+                num_K = 4,
+                graph_hidden_dim = 512,
                  args=None):
         
         super(Unimodal_MODEL, self).__init__()
+        
+        self.using_graph = using_graph
+        self.graph_hideen_dim = graph_hidden_dim
+        self.num_K = num_K
+        
+        
         self.n_classes = n_classes
         self.args = args
         self.no_cuda = no_cuda
@@ -550,9 +774,8 @@ class Unimodal_MODEL(nn.Module):
             self.ln_v = nn.LayerNorm(self.hidden_dim)
 
 
-        
-        # 결합 후 안정화용
-       
+        if self.using_graph:        
+            self.gcn = UNI_GCN(self.hidden_dim, self.graph_hideen_dim, self.num_K)       
         self.dropout_ = nn.Dropout(self.dropout)
 
 
@@ -650,6 +873,8 @@ class Unimodal_MODEL(nn.Module):
         
         emotions_feat = simple_batch_graphify(emotions_feat, seq_lengths, self.no_cuda)
         
+        if self.using_graph:
+            emotions_feat = self.gcn(emotions_feat, seq_lengths, qmask, epoch)
         
         
         emotions_feat = self.dropout_(emotions_feat)

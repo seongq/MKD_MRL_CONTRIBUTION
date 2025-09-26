@@ -267,6 +267,7 @@ if __name__ == '__main__':
     parser.add_argument("--using_multimodal_graph", default=False, action="store_true")
     parser.add_argument("--num_K", default=4, type=int)
     parser.add_argument("--graph_hidden_dim", default=512, type=int)
+
     args = parser.parse_args()
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     print(args)
@@ -311,7 +312,7 @@ if __name__ == '__main__':
     
     
     wandb.init(
-        project="CKPT_20250925_MKD_MRL_CALIB",   # ← 고정
+        project="CKPT_20250926_MKD_MRL_CALIB_MULTIMODAL_GRAPH",   # ← 고정
         name=run_name,
         config=vars(args)
     )
